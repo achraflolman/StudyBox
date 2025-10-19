@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <!-- This viewport tag is crucial for responsive design and auto-scaling on mobile devices. -->
+    <!-- It tells the browser to set the width of the page to the screen-width of the device, and the initial zoom level. This is the foundation of auto-scaling for mobile. -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>StudyBox</title>
+
+    <!-- App Manifest (icons managed by manifest.json) -->
+    <link rel="manifest" href="/manifest.json">
+    <meta name="msapplication-TileColor" content="#10b981">
+    <meta name="theme-color" content="#ffffff">
+
+    <!-- Tailwind is built via PostCSS (see index.css). Removed CDN for production. -->
+
+    <!-- Import maps (ESM) -->
+    <script type="importmap">
+{
+  "imports": {
+    "react": "https://esm.sh/react@18.3.1",
+    "react/": "https://esm.sh/react@18.3.1/",
+    "react-dom/": "https://esm.sh/react-dom@18.3.1/",
+    "lucide-react": "https://esm.sh/lucide-react@0.525.0?external=react",
+    "firebase/app": "https://esm.sh/firebase@8.10.1/app",
+    "firebase/auth": "https://esm.sh/firebase@8.10.1/auth",
+    "firebase/firestore": "https://esm.sh/firebase@8.10.1/firestore",
+    "firebase/storage": "https://esm.sh/firebase@8.10.1/storage",
+    "firebase/app-check": "https://esm.sh/firebase@8.10.1/app-check",
+    "@dnd-kit/core": "https://esm.sh/@dnd-kit/core@6.1.0?external=react",
+    "@dnd-kit/sortable": "https://esm.sh/@dnd-kit/sortable@8.0.0?external=react",
+    "@dnd-kit/utilities": "https://esm.sh/@dnd-kit/utilities@3.2.2?external=react",
+    "path": "https://aistudiocdn.com/path@^0.12.7",
+    "vite": "https://aistudiocdn.com/vite@^7.1.3",
+    "url": "https://aistudiocdn.com/url@^0.11.4",
+    "@google/genai": "https://esm.sh/@google/genai",
+    "firebase/": "https://aistudiocdn.com/firebase@^12.2.1/",
+    "marked": "https://esm.sh/marked@4.3.0",
+    "pdf.js": "https://esm.sh/pdfjs-dist@4.4.168/legacy/build/pdf.js"
+  }
+}
+</script>
+
+    <!-- Jouw CSS -->
+    <link rel="stylesheet" href="/index.css" />
+
+    <!-- Auto-scaling & Fluid Typography -->
+    <style>
+      /* This CSS rule makes the app's font size responsive, which helps the entire layout scale smoothly */
+      /* across different screen sizes, from small phones to large desktops, as requested. */
+      /* Combined with the viewport meta tag, this ensures the app auto-scales correctly on all devices. */
+      html {
+        font-size: clamp(13.5px, 0.84375rem + 0.25vw, 16px);
+      }
+    </style>
+  <link rel="stylesheet" href="/index.css">
+</head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/index.tsx"></script>
+  </body>
+</html>
