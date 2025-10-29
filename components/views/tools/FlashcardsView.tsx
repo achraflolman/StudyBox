@@ -1,0 +1,861 @@
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
+import { db, appId, Timestamp, increment } from '../../../services/firebase';
+import { GoogleGenAI, Type } from '@google/genai';
+import type { Flashcard, FlashcardSet, AppUser, ModalContent, SessionSummary, SessionAnswer } from '../../../types';
+import { PlusCircle, Trash2, ArrowLeft, Save, BookOpen, Settings, Brain, BarChart, RotateCcw, X, Check, Loader2, FileQuestion, Star, Layers, Sparkles, Share2, ChevronDown, Folder, Type as TypeIcon, Globe, Calculator, Atom, FlaskConical, Dna, ScrollText, AreaChart, Users, Languages, Code, Paintbrush, Music, Dumbbell, Film, CheckCircle, Send, DownloadCloud } from 'lucide-react';
+import ShareSetModal from './ShareSetModal';
+
+interface FlashcardsViewProps {
+  userId: string;
+  user: AppUser;
+  t: (key: string, replacements?: { [key: string]: string | number }) => string;
+  tSubject: (key: string) => string;
+  getThemeClasses: (variant: string) => string;
+  showAppModal: (content: ModalContent) => void;
+  onProfileUpdate: (updatedData: Partial<AppUser>) => Promise<void>;
+  setIsSessionActive?: (isActive: boolean) => void;
+  initialContext?: { set: FlashcardSet };
+  onBack?: () => void;
+  triggerHapticFeedback: (pattern?: number | number[]) => void;
+}
+
+type ViewType = 'subject-list' | 'set-list' | 'mode-selection' | 'manage' | 'learn' | 'cram' | 'mc' | 'vocab' | 'summary' | 'all-learned';
+
+const shuffleArray = (array: any[]) => {
+    for (let i = array.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [array[i], array[j]] = [array[j], array[i]];
+    }
+    return array;
+};
+
+const calculateStars = (correct: number, total: number): number => {
+    if (total === 0) return 0;
+    const percentage = correct / total;
+    if (percentage === 1) return 5;
+    if (percentage >= 0.8) return 3;
+    if (percentage >= 0.6) return 1;
+    return 0;
+};
+
+// ====================================================================
+// SUB-COMPONENTS (Moved to top to prevent ReferenceError)
+// ====================================================================
+
+const AIGenerateCardsModal: React.FC<{
+    isOpen: boolean;
+    onClose: () => void;
+    onGenerate: (topic: string, text: string) => Promise<void>;
+    isGenerating: boolean;
+    getThemeClasses: (variant: string) => string;
+    t: (key: string) => string;
+}> = ({ isOpen, onClose, onGenerate, isGenerating, getThemeClasses, t }) => {
+    const [text, setText] = useState('');
+    const [topic, setTopic] = useState('');
+
+    if (!isOpen) return null;
+
+    const handleGenerateClick = () => {
+        if (text.trim()) {
+            onGenerate(topic, text);
+        }
+    };
+
+    return (
+        <div className="fixed inset-0 bg-black bg-opacity-60 flex items-center justify-center p-4 z-50 animate-fade-in" onClick={onClose}>
+            <div className="bg-white rounded-2xl shadow-2xl p-6 max-w-lg w-full transform transition-all duration-300 scale-100 animate-scale-up" onClick={e => e.stopPropagation()}>
+                <h3 className="text-xl font-bold mb-2">{t('flashcard_ai_modal_title')}</h3>
+                <p className="text-sm text-gray-600 mb-4">{t('flashcard_ai_modal_desc')}</p>
+                
+                <div className="space-y-4">
+                    <input 
+                        type="text"
+                        value={topic}
+                        onChange={(e) => setTopic(e.target.value)}
+                        placeholder={t('flashcard_ai_topic_placeholder')}
+                        className="w-full p-2 border rounded-lg"
+                        disabled={isGenerating}
+                    />
+                    <textarea
+                        value={text}
+                        onChange={(e) => setText(e.target.value)}
+                        rows={8}
+                        className="w-full p-2 border rounded-lg"
+                        placeholder={t('flashcard_ai_placeholder')}
+                        disabled={isGenerating}
+                    />
+                </div>
+
+                <div className="flex justify-end gap-2 mt-6">
+                    <button onClick={onClose} disabled={isGenerating} className="py-2 px-4 rounded-lg bg-gray-200 hover:bg-gray-300 font-semibold transition-colors active:scale-95">{t('cancel_button')}</button>
+                    <button onClick={handleGenerateClick} disabled={isGenerating || !text.trim()} className={`py-2 px-4 rounded-lg text-white font-bold ${getThemeClasses('bg')} ${getThemeClasses('hover-bg')} transition-colors active:scale-95 w-32 flex items-center justify-center`}>
+                        {isGenerating ? <Loader2 className="animate-spin"/> : t('generate_button')}
+                    </button>
+                </div>
+            </div>
+        </div>
+    );
+};
+
+const CardManagerView: React.FC<any> = ({ set, onBack, userId, t, getThemeClasses, showAppModal }) => {
+    const [cards, setCards] = useState<Flashcard[]>([]);
+    const [isLoading, setIsLoading] = useState(true);
+    const [isAIGenerateOpen, setIsAIGenerateOpen] = useState(false);
+    const [isGenerating, setIsGenerating] = useState(false);
+    const [newCardRows, setNewCardRows] = useState<{ q: string, a: string }[]>([{ q: '', a: '' }]);
+
+    useEffect(() => {
+        if (set.isCombined || (set.isShared && set.cards)) {
+            // For combined sets or newly accepted shared sets, cards are embedded
+            const embeddedCards = (set.cards || []).map((c: any, i: number) => ({ ...c, id: `embedded-${i}` }));
+            setCards(embeddedCards);
+            setIsLoading(false);
+            return;
+        }
+        
+        // For regular and previously accepted sets, fetch from subcollection
+        const unsub = db.collection(`users/${userId}/flashcardDecks/${set.id}/cards`).orderBy('createdAt', 'asc').onSnapshot(snap => {
+            setCards(snap.docs.map(d => ({ id: d.id, ...d.data() } as Flashcard)));
+            setIsLoading(false);
+        }, err => {
+            console.error("Error fetching cards:", err);
+            setIsLoading(false);
+        });
+        return () => unsub();
+    }, [set, userId]);
+
+
+    const handleSaveCards = async () => {
+        const cardsToAdd = newCardRows.filter(row => row.q.trim() && row.a.trim());
+        if (cardsToAdd.length === 0) {
+            showAppModal({ text: t('error_empty_flashcard') });
+            return;
+        }
+        const batch = db.batch();
+        cardsToAdd.forEach(card => {
+            const cardRef = db.collection(`users/${userId}/flashcardDecks/${set.id}/cards`).doc();
+            batch.set(cardRef, { question: card.q, answer: card.a, ownerId: userId, createdAt: Timestamp.now(), dueDate: Timestamp.now(), interval: 0, easeFactor: 2.5 });
+        });
+        const setRef = db.doc(`users/${userId}/flashcardDecks/${set.id}`);
+        batch.update(setRef, { cardCount: increment(cardsToAdd.length) });
+        await batch.commit();
+        setNewCardRows([{ q: '', a: '' }]);
+        showAppModal({ text: t('flashcard_added_success') });
+    };
+
+    const handleDeleteCard = (cardId: string) => {
+        const batch = db.batch();
+        const cardRef = db.doc(`users/${userId}/flashcardDecks/${set.id}/cards/${cardId}`);
+        batch.delete(cardRef);
+        const setRef = db.doc(`users/${userId}/flashcardDecks/${set.id}`);
+        batch.update(setRef, { cardCount: increment(-1) });
+        batch.commit();
+    };
+
+    const handleAIGenerate = async (topic: string, text: string) => {
+        setIsGenerating(true);
+        showAppModal({ text: t('flashcards_creating_message') });
+        try {
+            const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+            const prompt = `Based on the following notes about "${topic}", generate a concise list of question-and-answer pairs for flashcards. The question should be on one line, and the answer on the next, separated by a newline. Example:
+Question 1
+Answer 1
+Question 2
+Answer 2
+
+Notes:
+---
+${text}
+---`;
+            const response = await ai.models.generateContent({ model: 'gemini-2.5-flash', contents: prompt });
+            const generatedText = response.text;
+            const lines = generatedText.split('\n').filter(line => line.trim() !== '');
+            const generatedPairs = [];
+            for (let i = 0; i < lines.length; i += 2) {
+                if (lines[i+1]) {
+                    generatedPairs.push({ q: lines[i].trim(), a: lines[i+1].trim() });
+                }
+            }
+            setNewCardRows(prev => [...prev.filter(r => r.q.trim() || r.a.trim()), ...generatedPairs]);
+            setIsAIGenerateOpen(false);
+        } catch (error) {
+            console.error(error);
+            showAppModal({ text: "AI generation failed." });
+        } finally {
+            setIsGenerating(false);
+        }
+    };
+
+    return (
+        <div className={`p-4 rounded-lg shadow-inner ${getThemeClasses('bg-light')} space-y-4`}>
+             <AIGenerateCardsModal isOpen={isAIGenerateOpen} onClose={() => setIsAIGenerateOpen(false)} onGenerate={handleAIGenerate} isGenerating={isGenerating} getThemeClasses={getThemeClasses} t={t} />
+             <div className="flex justify-between items-center">
+                <button onClick={onBack} className="p-2 rounded-full hover:bg-gray-200 transition-colors"><ArrowLeft/></button>
+                <h3 className="font-bold text-xl text-center truncate">{set.name}</h3>
+                <div className="w-9 h-9"></div>
+            </div>
+
+            {!(set.isShared && !set.isCombined) && (
+                <div className="bg-white p-4 rounded-lg shadow-md space-y-3">
+                    <div className="flex justify-between items-center">
+                        <h4 className="font-bold text-lg">{t('add_flashcard')}</h4>
+                        <button onClick={() => setIsAIGenerateOpen(true)} className={`flex items-center gap-2 py-2 px-3 rounded-lg text-white font-bold bg-purple-500 hover:bg-purple-600 transition-colors active:scale-95 text-sm`}>
+                            <Sparkles size={16}/> {t('flashcard_ai_modal_title')}
+                        </button>
+                    </div>
+                    {newCardRows.map((row, index) => (
+                        <div key={index} className="flex gap-2 items-center">
+                            <input value={row.q} onChange={e => setNewCardRows(rows => rows.map((r, i) => i === index ? {...r, q: e.target.value} : r))} placeholder={t('question')} className="w-1/2 p-2 border rounded-lg" />
+                            <input value={row.a} onChange={e => setNewCardRows(rows => rows.map((r, i) => i === index ? {...r, a: e.target.value} : r))} placeholder={t('answer')} className="w-1/2 p-2 border rounded-lg" />
+                        </div>
+                    ))}
+                    <div className="flex justify-between gap-2">
+                         <button onClick={() => setNewCardRows(prev => [...prev, ...Array(5).fill({q:'', a:''})])} className="py-2 px-4 rounded-lg bg-gray-200 hover:bg-gray-300 font-semibold">{t('add_more_rows')}</button>
+                         <button onClick={handleSaveCards} className={`flex items-center gap-2 py-2 px-4 rounded-lg text-white font-bold ${getThemeClasses('bg')}`}><Save size={16}/> {t('save_note_button')}</button>
+                    </div>
+                </div>
+            )}
+            
+            <div className="bg-white p-4 rounded-lg shadow-md space-y-2 max-h-96 overflow-y-auto">
+                {isLoading ? <Loader2 className="animate-spin mx-auto" /> : cards.length === 0 ? <p className="text-center text-gray-500 italic p-4">{t('no_flashcards_found')}</p> : cards.map(card => (
+                    <div key={card.id} className="p-2 border-b flex justify-between items-start">
+                        <div>
+                            <p className="font-semibold">{card.question}</p>
+                            <p className="text-sm text-gray-600">{card.answer}</p>
+                        </div>
+                       {!(set.isShared && !set.isCombined) && <button onClick={() => handleDeleteCard(card.id)} className="p-2 text-red-500 hover:bg-red-100 rounded-full flex-shrink-0"><Trash2 size={16}/></button>}
+                    </div>
+                ))}
+            </div>
+        </div>
+    );
+};
+
+const LearnSessionView: React.FC<any> = ({ set, onExit, t }) => (
+    <div>
+        <button onClick={onExit}>{t('exit_session')}</button>
+        <h1>{t('study_mode_learn_title')} for {set.name}</h1>
+        <p>Implementation for learning session (SRS) will go here.</p>
+    </div>
+);
+
+const CramSessionView: React.FC<any> = ({ set, onExit, t }) => (
+    <div>
+        <button onClick={onExit}>{t('exit_session')}</button>
+        <h1>{t('study_mode_cram_title')} for {set.name}</h1>
+        <p>Implementation for cramming session will go here.</p>
+    </div>
+);
+
+const MultipleChoiceSessionView: React.FC<any> = ({ set, onExit, t }) => (
+    <div>
+        <button onClick={onExit}>{t('exit_session')}</button>
+        <h1>{t('study_mode_mc_title')} for {set.name}</h1>
+        <p>Implementation for multiple choice session will go here.</p>
+    </div>
+);
+
+const VocabSessionView: React.FC<any> = ({ set, onExit, onSessionComplete, userId, t, getThemeClasses, showAppModal, triggerHapticFeedback }) => {
+    const [cards, setCards] = useState<Flashcard[]>([]);
+    const [isLoading, setIsLoading] = useState(true);
+    const [currentIndex, setCurrentIndex] = useState(0);
+    const [userAnswer, setUserAnswer] = useState('');
+    const [isChecking, setIsChecking] = useState(false);
+    const [feedback, setFeedback] = useState<'correct' | 'incorrect' | null>(null);
+    const [sessionAnswers, setSessionAnswers] = useState<SessionAnswer[]>([]);
+    const startTimeRef = useRef(Date.now());
+
+    useEffect(() => {
+        const fetchCards = async () => {
+            setIsLoading(true);
+            if (set.isCombined) {
+                setCards(shuffleArray([...(set.cards || [])]));
+            } else {
+                const cardsSnapshot = await db.collection(`users/${userId}/flashcardDecks/${set.id}/cards`).get();
+                setCards(shuffleArray(cardsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Flashcard))));
+            }
+            setIsLoading(false);
+        };
+        fetchCards();
+    }, [set, userId]);
+
+    if (isLoading) {
+        return <div className="text-center p-8"><Loader2 className="animate-spin mx-auto" /> {t('loading_cards')}</div>;
+    }
+
+    if (cards.length === 0) {
+        return <div>{t('no_flashcards_found')}</div>;
+    }
+
+    const currentCard = cards[currentIndex];
+
+    const checkAnswer = async () => {
+        setIsChecking(true);
+        let isCorrect = userAnswer.trim().toLowerCase() === currentCard.answer.trim().toLowerCase();
+
+        if (!isCorrect && process.env.API_KEY) {
+            try {
+                const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+                const prompt = `Is the user's answer "${userAnswer}" a correct synonym or alternative for the correct answer "${currentCard.answer}"? Answer only with "YES" or "NO".`;
+                const response = await ai.models.generateContent({ model: 'gemini-2.5-flash', contents: prompt });
+                if (response.text.trim().toUpperCase() === 'YES') {
+                    isCorrect = true;
+                }
+            } catch (error) {
+                console.error("AI check failed:", error);
+                showAppModal({ text: t('error_ai_check_failed') });
+            }
+        }
+
+        if (isCorrect) {
+            triggerHapticFeedback();
+        }
+        setFeedback(isCorrect ? 'correct' : 'incorrect');
+        setSessionAnswers(prev => [...prev, { card: currentCard, userAnswer, isCorrect }]);
+        setIsChecking(false);
+    };
+
+    const nextCard = () => {
+        setFeedback(null);
+        setUserAnswer('');
+        if (currentIndex + 1 < cards.length) {
+            setCurrentIndex(prev => prev + 1);
+        } else {
+            const correct = sessionAnswers.filter(a => a.isCorrect).length;
+            onSessionComplete({
+                stats: { correct, incorrect: cards.length - correct, total: cards.length, startTime: startTimeRef.current, endTime: Date.now() },
+                answers: sessionAnswers,
+                earnedStars: calculateStars(correct, cards.length),
+            });
+        }
+    };
+
+    return (
+        <div className={`p-4 rounded-lg shadow-inner ${getThemeClasses('bg-light')} space-y-4`}>
+            <div className="flex justify-between items-center">
+                <button onClick={onExit} className="p-2 rounded-full hover:bg-gray-200"><X/></button>
+                <h3 className="font-bold text-xl text-center">{set.name}</h3>
+                <div className="font-semibold">{t('cards_to_go_counter', { current: currentIndex + 1, total: cards.length })}</div>
+            </div>
+
+            <div className="bg-white p-6 rounded-lg shadow-md min-h-[200px] flex items-center justify-center">
+                <p className="text-2xl font-semibold text-center">{currentCard.question}</p>
+            </div>
+            
+            {!feedback ? (
+                 <form onSubmit={e => { e.preventDefault(); checkAnswer(); }} className="space-y-2">
+                    <input
+                        type="text"
+                        value={userAnswer}
+                        onChange={e => setUserAnswer(e.target.value)}
+                        placeholder={t('answer')}
+                        className="w-full p-3 border rounded-lg text-lg"
+                        autoFocus
+                    />
+                    <button type="submit" disabled={isChecking} className={`w-full py-3 px-4 rounded-lg text-white font-bold text-lg flex items-center justify-center ${getThemeClasses('bg')}`}>
+                        {isChecking ? <><Loader2 className="animate-spin mr-2"/> {t('ai_checking_answer')}</> : t('submit_answer')}
+                    </button>
+                 </form>
+            ) : (
+                <div className="space-y-4">
+                     <div className={`p-4 rounded-lg text-center font-semibold text-lg ${feedback === 'correct' ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'}`}>
+                        {feedback === 'correct' ? t('ai_feedback_correct') : t('ai_feedback_incorrect', { correct_answer: currentCard.answer })}
+                    </div>
+                    <button onClick={nextCard} className={`w-full py-3 px-4 rounded-lg text-white font-bold text-lg ${getThemeClasses('bg')}`}>
+                        {t('next_card')}
+                    </button>
+                </div>
+            )}
+        </div>
+    );
+};
+
+const SessionSummaryView: React.FC<any> = ({ set, summary, onBack, setView, onStartSession, setSelectedSet, t, getThemeClasses, userId }) => {
+    const { stats, answers, earnedStars } = summary;
+    const grade = (stats.correct / stats.total) * 9 + 1;
+
+    const incorrectAnswers = answers.filter((a: SessionAnswer) => !a.isCorrect);
+
+    const handleCreateSetFromIncorrect = async () => {
+        if (incorrectAnswers.length === 0) return;
+        
+        const newSetName = prompt(t('new_set_name_prompt'), `${set.name} - ${t('practice_incorrect')}`);
+        if (!newSetName) return;
+
+        const batch = db.batch();
+        const newSetRef = db.collection(`users/${userId}/flashcardDecks`).doc();
+        batch.set(newSetRef, {
+            name: newSetName,
+            subject: set.subject,
+            ownerId: userId,
+            createdAt: Timestamp.now(),
+            cardCount: incorrectAnswers.length
+        });
+        
+        incorrectAnswers.forEach((answer: SessionAnswer) => {
+            const newCardRef = newSetRef.collection('cards').doc();
+            // Create a clean card object, resetting SRS data
+            const newCardData = {
+                question: answer.card.question,
+                answer: answer.card.answer,
+                ownerId: userId,
+                createdAt: Timestamp.now(),
+                dueDate: Timestamp.now(),
+                interval: 0,
+                easeFactor: 2.5,
+            };
+            batch.set(newCardRef, newCardData);
+        });
+        await batch.commit();
+        alert(t('new_set_created_success', {name: newSetName}));
+    };
+    
+    const handlePracticeIncorrect = () => {
+        if (incorrectAnswers.length === 0) {
+            alert(t('no_incorrect_answers'));
+            return;
+        }
+        const practiceSet: FlashcardSet = {
+            id: 'practice-' + Date.now(),
+            name: `${set.name} - ${t('practice_incorrect')}`,
+            subject: set.subject,
+            ownerId: userId,
+            createdAt: Timestamp.now(),
+            cardCount: incorrectAnswers.length,
+            isCombined: true,
+            cards: incorrectAnswers.map((a: SessionAnswer) => a.card)
+        };
+        setSelectedSet(practiceSet);
+        setView('mode-selection');
+    };
+
+    return (
+        <div className={`p-4 rounded-lg shadow-inner ${getThemeClasses('bg-light')} space-y-4`}>
+            <div className="flex justify-between items-center">
+                <button onClick={onBack} className="p-2 rounded-full hover:bg-gray-200"><ArrowLeft/></button>
+                <h3 className="font-bold text-xl text-center">{t('session_summary_title')}</h3>
+                <div className="w-9 h-9"></div>
+            </div>
+
+            <div className="bg-white p-6 rounded-lg shadow-md text-center">
+                {earnedStars > 0 && (
+                    <div className="mb-4">
+                        <h4 className="font-bold text-lg">{t('stars_earned_title')}</h4>
+                        <div className="flex justify-center text-yellow-400">
+                            {Array.from({length: earnedStars}).map((_, i) => <Star key={i} size={32} className="fill-current"/>)}
+                        </div>
+                    </div>
+                )}
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                    <div><p className="text-xs uppercase text-gray-500">{t('your_grade')}</p><p className="text-2xl font-bold">{grade.toFixed(1)}</p></div>
+                    <div><p className="text-xs uppercase text-gray-500">{t('correct_answers')}</p><p className="text-2xl font-bold text-green-600">{stats.correct}</p></div>
+                    <div><p className="text-xs uppercase text-gray-500">{t('incorrect_answers')}</p><p className="text-2xl font-bold text-red-600">{stats.incorrect}</p></div>
+                    <div><p className="text-xs uppercase text-gray-500">{t('time_spent')}</p><p className="text-2xl font-bold">{Math.round((stats.endTime - stats.startTime)/1000)}s</p></div>
+                </div>
+            </div>
+
+            <div className="space-y-2">
+                 <button onClick={handlePracticeIncorrect} disabled={incorrectAnswers.length === 0} className="w-full py-2 px-4 rounded-lg bg-orange-500 hover:bg-orange-600 text-white font-semibold disabled:opacity-50">{t('practice_incorrect')} ({incorrectAnswers.length})</button>
+                 <button onClick={handleCreateSetFromIncorrect} disabled={incorrectAnswers.length === 0} className="w-full py-2 px-4 rounded-lg bg-indigo-500 hover:bg-indigo-600 text-white font-semibold disabled:opacity-50">{t('create_set_from_incorrect')}</button>
+            </div>
+            
+            <div className="max-h-60 overflow-y-auto space-y-2 bg-white p-4 rounded-lg shadow-md">
+                {answers.map((answer: SessionAnswer, index: number) => (
+                    <div key={index} className={`p-3 rounded-lg ${answer.isCorrect ? 'bg-green-50 border-l-4 border-green-400' : 'bg-red-50 border-l-4 border-red-400'}`}>
+                        <p className="font-semibold">{answer.card.question}</p>
+                        <p className="text-sm"><span className="font-bold">{t('correct_answer')}:</span> {answer.card.answer}</p>
+                        {!answer.isCorrect && answer.userAnswer && <p className="text-sm text-red-700"><span className="font-bold">{t('your_answer')}:</span> {answer.userAnswer}</p>}
+                    </div>
+                ))}
+            </div>
+        </div>
+    );
+};
+
+const AllCardsLearnedView: React.FC<any> = ({ set, setView, t, getThemeClasses }) => {
+    return (
+        <div className={`p-6 rounded-lg shadow-inner text-center ${getThemeClasses('bg-light')}`}>
+            <CheckCircle className={`w-16 h-16 mx-auto mb-4 ${getThemeClasses('text')}`} />
+            <h3 className="text-2xl font-bold">{t('all_cards_learned_title')}</h3>
+            <p className="text-gray-600 mt-2 mb-6">{t('all_cards_learned_desc')}</p>
+            <div className="flex flex-col sm:flex-row gap-2 justify-center">
+                <button onClick={() => setView('mode-selection')} className="py-2 px-4 rounded-lg bg-gray-200 hover:bg-gray-300 font-semibold">{t('choose_other_method_button')}</button>
+                <button onClick={() => { /* Need reset logic here if required */ setView('learn'); }} className={`py-2 px-4 rounded-lg text-white font-bold ${getThemeClasses('bg')}`}>{t('reset_and_start_over_button')}</button>
+            </div>
+        </div>
+    );
+};
+
+const SubjectSelectionForFlashcards: React.FC<any> = ({ onSelectSubject, onBack, ...props }) => {
+    const { user, t, tSubject, getThemeClasses } = props;
+    const userSubjects = useMemo(() => Array.from(new Set([...(user.selectedSubjects || []), ...(user.customSubjects || [])])), [user.selectedSubjects, user.customSubjects]);
+    
+    const subjectIcons = useMemo(() => ({
+        'aardrijkskunde': <Globe className={`w-12 h-12 mx-auto mb-2 ${getThemeClasses('text')}`} />,
+        'wiskunde': <Calculator className={`w-12 h-12 mx-auto mb-2 ${getThemeClasses('text')}`} />,
+        'natuurkunde': <Atom className={`w-12 h-12 mx-auto mb-2 ${getThemeClasses('text')}`} />,
+        'scheikunde': <FlaskConical className={`w-12 h-12 mx-auto mb-2 ${getThemeClasses('text')}`} />,
+        'biologie': <Dna className={`w-12 h-12 mx-auto mb-2 ${getThemeClasses('text')}`} />,
+        'geschiedenis': <ScrollText className={`w-12 h-12 mx-auto mb-2 ${getThemeClasses('text')}`} />,
+        'latijn': <ScrollText className={`w-12 h-12 mx-auto mb-2 ${getThemeClasses('text')}`} />,
+        'economie': <AreaChart className={`w-12 h-12 mx-auto mb-2 ${getThemeClasses('text')}`} />,
+        'maatschappijleer': <Users className={`w-12 h-12 mx-auto mb-2 ${getThemeClasses('text')}`} />,
+        'nederlands': <Languages className={`w-12 h-12 mx-auto mb-2 ${getThemeClasses('text')}`} />,
+        'engels': <Languages className={`w-12 h-12 mx-auto mb-2 ${getThemeClasses('text')}`} />,
+        'frans': <Languages className={`w-12 h-12 mx-auto mb-2 ${getThemeClasses('text')}`} />,
+        'duits': <Languages className={`w-12 h-12 mx-auto mb-2 ${getThemeClasses('text')}`} />,
+        'informatica': <Code className={`w-12 h-12 mx-auto mb-2 ${getThemeClasses('text')}`} />,
+        'kunst': <Paintbrush className={`w-12 h-12 mx-auto mb-2 ${getThemeClasses('text')}`} />,
+        'muziek': <Music className={`w-12 h-12 mx-auto mb-2 ${getThemeClasses('text')}`} />,
+        'lichamelijke_opvoeding': <Dumbbell className={`w-12 h-12 mx-auto mb-2 ${getThemeClasses('text')}`} />,
+        'ckv': <Film className={`w-12 h-12 mx-auto mb-2 ${getThemeClasses('text')}`} />,
+        'default': <Folder className={`w-12 h-12 mx-auto mb-2 ${getThemeClasses('text')}`} />
+    }), [getThemeClasses]);
+
+    const getIconForSubject = (subjectKey: string) => {
+      return subjectIcons[subjectKey as keyof typeof subjectIcons] || subjectIcons['default'];
+    };
+    
+    return (
+        <div className={`p-4 rounded-lg shadow-inner ${getThemeClasses('bg-light')} space-y-4`}>
+            <div className="flex items-center">
+                {onBack && <button onClick={onBack} className="p-2 rounded-full hover:bg-gray-200 transition-colors"><ArrowLeft/></button>}
+                <h3 className={`font-bold text-xl flex-grow text-center ${getThemeClasses('text-strong')}`}>{t('flashcards')}</h3>
+                <div className="w-9 h-9"></div> {/* Placeholder for centering */}
+            </div>
+
+            {userSubjects.length === 0 ? (
+                <div className="text-center py-10 text-gray-500">
+                    <h3 className="text-xl font-semibold">{t('no_subjects_flashcards')}</h3>
+                    <p>{t('go_to_settings_flashcards')}</p>
+                </div>
+            ) : (
+                <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
+                    {userSubjects.map(subject => (
+                        <button key={subject} onClick={() => onSelectSubject(subject)} className="bg-white p-6 rounded-lg shadow-md text-center font-semibold hover:shadow-lg hover:-translate-y-1 transition-all duration-200">
+                            {getIconForSubject(subject)}
+                            {tSubject(subject)}
+                        </button>
+                    ))}
+                </div>
+            )}
+        </div>
+    );
+};
+
+const SetListView: React.FC<any> = ({ subject, setSelectedSet, setView, onBack, onShare, ...props }) => {
+    const { userId, t, tSubject, getThemeClasses, showAppModal, user } = props;
+    const [ownedSets, setOwnedSets] = useState<FlashcardSet[]>([]);
+    const [incomingSets, setIncomingSets] = useState<FlashcardSet[]>([]);
+    const [isLoading, setIsLoading] = useState(true);
+    const [newSetName, setNewSetName] = useState('');
+    const [isCombining, setIsCombining] = useState(false);
+    const [isCombiningLoading, setIsCombiningLoading] = useState(false);
+    const [selectedSetIds, setSelectedSetIds] = useState<string[]>([]);
+    
+    useEffect(() => {
+        if (user.uid === 'guest-user') { 
+            setIsLoading(false); 
+            return; 
+        }
+        
+        setIsLoading(true);
+
+        const ownedSetsQuery = db.collection(`users/${userId}/flashcardDecks`).where('subject', '==', subject);
+        const unsubOwned = ownedSetsQuery.onSnapshot(snap => {
+            setOwnedSets(snap.docs.map(d => ({ id: d.id, ...d.data() } as FlashcardSet)));
+            setIsLoading(false);
+        }, err => { 
+            console.error("Error fetching owned sets:", err); 
+            showAppModal({ text: `Error fetching sets: ${err.message}` });
+            setIsLoading(false); 
+        });
+
+        const sharedSetsQuery = db.collection('sharedSets').where('recipientEmail', '==', user.email).where('subject', '==', subject);
+        const unsubShared = sharedSetsQuery.onSnapshot(snap => {
+            const sets = snap.docs.map(d => {
+                const data = d.data();
+                return {
+                    id: d.id,
+                    name: data.name,
+                    subject: data.subject,
+                    createdAt: data.sharedAt,
+                    cardCount: data.cards?.length || 0,
+                    isShared: true,
+                    sharerName: data.sharerName,
+                    cards: data.cards
+                } as FlashcardSet;
+            });
+            setIncomingSets(sets);
+        });
+
+        return () => {
+            unsubOwned();
+            unsubShared();
+        };
+    }, [userId, subject, user.uid, user.email, showAppModal]);
+
+    const handleCreateSet = async (e: React.FormEvent) => {
+        e.preventDefault();
+        if (!newSetName.trim()) {
+            showAppModal({ text: t('error_empty_set_name') });
+            return;
+        }
+        await db.collection(`users/${userId}/flashcardDecks`).add({
+            name: newSetName,
+            subject,
+            ownerId: userId,
+            createdAt: Timestamp.now(),
+            cardCount: 0
+        });
+        setNewSetName('');
+    };
+
+    const handleDeleteSet = (setId: string) => {
+        showAppModal({
+            text: t('confirm_delete_set', { name: ownedSets.find(s => s.id === setId)?.name || '' }),
+            confirmAction: async () => {
+                const batch = db.batch();
+                const cardsRef = db.collection(`users/${userId}/flashcardDecks/${setId}/cards`);
+                const cardsSnapshot = await cardsRef.get();
+                cardsSnapshot.docs.forEach(doc => batch.delete(doc.ref));
+                const setRef = db.doc(`users/${userId}/flashcardDecks/${setId}`);
+                batch.delete(setRef);
+                await batch.commit();
+            },
+            cancelAction: () => {}
+        });
+    };
+    
+    const handleAcceptSet = async (set: FlashcardSet) => {
+        try {
+            const batch = db.batch();
+            const newSetRef = db.collection(`users/${userId}/flashcardDecks`).doc();
+            batch.set(newSetRef, {
+                name: set.name,
+                subject: set.subject,
+                ownerId: userId,
+                createdAt: Timestamp.now(),
+                cardCount: set.cards?.length || 0,
+                isShared: true,
+                sharerName: set.sharerName,
+            });
+
+            (set.cards || []).forEach(card => {
+                const cardRef = newSetRef.collection('cards').doc();
+                batch.set(cardRef, {
+                    question: card.question,
+                    answer: card.answer,
+                    ownerId: userId, // New owner
+                    createdAt: Timestamp.now(),
+                    dueDate: Timestamp.now(),
+                    interval: 0,
+                    easeFactor: 2.5,
+                });
+            });
+            
+            batch.delete(db.doc(`sharedSets/${set.id}`));
+            
+            await batch.commit();
+            showAppModal({text: t('accept_set_success', { title: set.name })});
+
+        } catch (error) {
+             showAppModal({text: t('error_accept_set_failed')});
+        }
+    };
+    
+    const handleCombine = async () => {
+        if (selectedSetIds.length < 2) {
+            showAppModal({ text: t('error_select_min_two_sets') });
+            return;
+        }
+        setIsCombiningLoading(true);
+        let allCards: Flashcard[] = [];
+        for (const setId of selectedSetIds) {
+            const set = ownedSets.find(s => s.id === setId);
+            if (set) {
+                const cardsSnapshot = await db.collection(`users/${userId}/flashcardDecks/${setId}/cards`).get();
+                const cards = cardsSnapshot.docs.map(d => d.data() as Flashcard);
+                allCards = [...allCards, ...cards];
+            }
+        }
+        const combinedSet: FlashcardSet = {
+            id: 'combined-' + Date.now(),
+            name: t('combined_set_name', {count: selectedSetIds.length}),
+            subject: subject,
+            ownerId: userId,
+            createdAt: Timestamp.now(),
+            cardCount: allCards.length,
+            isCombined: true,
+            combinedFrom: selectedSetIds,
+            cards: allCards,
+        };
+        setSelectedSet(combinedSet);
+        setView('mode-selection');
+        setIsCombiningLoading(false);
+    };
+
+    return (
+        <div className={`p-4 rounded-lg shadow-inner ${getThemeClasses('bg-light')} space-y-4`}>
+            {/* Header */}
+            <div className="flex justify-between items-center">
+                <button onClick={onBack} className="p-2 rounded-full hover:bg-gray-200"><ArrowLeft/></button>
+                <h3 className="font-bold text-xl text-center">{t('sets_for_subject', {subject: tSubject(subject)})}</h3>
+                <div className="w-9 h-9"></div>
+            </div>
+
+            {/* Incoming Shared Sets */}
+            {incomingSets.length > 0 && (
+                 <div className="bg-blue-50 p-3 rounded-lg border-l-4 border-blue-400">
+                    <h4 className="font-bold text-blue-800">{t('incoming_shared_sets')}</h4>
+                    {incomingSets.map(set => (
+                         <div key={set.id} className="flex justify-between items-center p-2 mt-1 bg-white rounded-md">
+                            <div>
+                                <p className="font-semibold">{set.name}</p>
+                                <p className="text-xs text-gray-500">{t('shared_by', {name: set.sharerName})}</p>
+                            </div>
+                            <button onClick={() => handleAcceptSet(set)} className="text-sm font-semibold bg-green-500 text-white px-3 py-1 rounded-md">{t('accept_button')}</button>
+                        </div>
+                    ))}
+                </div>
+            )}
+
+            {/* Add/Combine Set */}
+             <div className="bg-white p-4 rounded-lg shadow-md space-y-3">
+                 <div className="flex justify-between items-center">
+                    <h4 className="font-bold text-lg">{isCombining ? 'Combine Sets' : t('set_name_placeholder')}</h4>
+                     <button onClick={() => setIsCombining(!isCombining)} title={isCombining ? t('cancel_button') : 'Combine Sets'} className={`p-2 rounded-lg ${isCombining ? 'bg-red-100 text-red-600' : 'bg-blue-100 text-blue-600'}`}>
+                        {isCombining ? <X size={16}/> : <Layers size={16}/>}
+                    </button>
+                 </div>
+                {isCombining ? (
+                    <div className="space-y-2">
+                        <div className="max-h-40 overflow-y-auto space-y-1 border p-2 rounded-lg">
+                            {ownedSets.map(set => (
+                                <label key={set.id} className="flex items-center gap-2 p-1.5 rounded bg-gray-50">
+                                    <input type="checkbox" checked={selectedSetIds.includes(set.id)} onChange={() => setSelectedSetIds(p => p.includes(set.id) ? p.filter(id => id !== set.id) : [...p, set.id])} className="h-4 w-4 rounded" />
+                                    <span>{set.name}</span>
+                                </label>
+                            ))}
+                        </div>
+                        <button onClick={handleCombine} disabled={isCombiningLoading} className="w-full flex items-center justify-center gap-2 py-2 px-4 rounded-lg text-white font-bold bg-blue-500">
+                           {isCombiningLoading ? <Loader2 className="animate-spin" /> : 'Combine Selected'}
+                        </button>
+                    </div>
+                ) : (
+                    <form onSubmit={handleCreateSet} className="flex gap-2">
+                        <input value={newSetName} onChange={e => setNewSetName(e.target.value)} placeholder={t('set_name_placeholder')} className="flex-grow p-2 border rounded-lg"/>
+                        <button type="submit" className={`flex items-center text-white font-bold py-2 px-4 rounded-lg ${getThemeClasses('bg')}`}><PlusCircle size={16}/> </button>
+                    </form>
+                )}
+            </div>
+            
+            {/* Set List */}
+            <div className="space-y-3">
+                {isLoading ? <Loader2 className="animate-spin mx-auto"/> : ownedSets.length === 0 ? <p className="text-center text-gray-500 italic py-8">{t('no_sets_found')}</p> : ownedSets.map(set => (
+                    <div key={set.id} className="bg-white p-3 rounded-lg shadow-sm flex justify-between items-center">
+                        <div>
+                            <p className="font-semibold">{set.name} {set.isShared && `(Gedeeld)`}</p>
+                            <p className="text-sm text-gray-500">{t('cards_in_set', {count: set.cardCount || 0})}</p>
+                        </div>
+                        <div className="flex gap-2">
+                            <button onClick={() => { setSelectedSet(set); setView('manage'); }} className="text-sm font-semibold bg-gray-200 px-3 py-1 rounded-md">{t('manage_cards')}</button>
+                            <button onClick={() => onShare(set)} className="p-2 bg-blue-100 rounded-md text-blue-600"><Share2 size={16}/></button>
+                            <button onClick={() => handleDeleteSet(set.id)} className="p-2 text-red-500 bg-red-100 rounded-md"><Trash2 size={16}/></button>
+                            <button onClick={() => { setSelectedSet(set); setView('mode-selection'); }} className={`text-sm font-bold text-white px-3 py-1 rounded-md ${getThemeClasses('bg')}`}>Start</button>
+                        </div>
+                    </div>
+                ))}
+            </div>
+        </div>
+    );
+};
+const FlashcardsView: React.FC<FlashcardsViewProps> = ({ userId, user, t, tSubject, getThemeClasses, showAppModal, onProfileUpdate, setIsSessionActive, initialContext, onBack, triggerHapticFeedback }) => {
+    const [view, setView] = useState<ViewType>(initialContext?.set ? 'mode-selection' : 'subject-list');
+    const [selectedSubject, setSelectedSubject] = useState<string | null>(initialContext?.set?.subject || null);
+    const [selectedSet, setSelectedSet] = useState<FlashcardSet | null>(initialContext?.set || null);
+    const [sessionSummary, setSessionSummary] = useState<SessionSummary | null>(null);
+    const [isShareModalOpen, setIsShareModalOpen] = useState(false);
+    const [setForSharing, setSetForSharing] = useState<FlashcardSet | null>(null);
+
+    const handleStartSession = useCallback((mode: 'learn' | 'cram' | 'mc' | 'vocab') => {
+        if (!selectedSet) return;
+        if (mode === 'mc' && (selectedSet.cardCount || 0) < 2) {
+            showAppModal({ text: t('error_flashcard_set_min_cards') });
+            return;
+        }
+         if (mode === 'vocab' && (selectedSet.cardCount || 0) < 1) {
+            showAppModal({ text: t('error_vocab_set_min_cards') });
+            return;
+        }
+        setView(mode);
+        if (setIsSessionActive) setIsSessionActive(true);
+    }, [selectedSet, showAppModal, t, setIsSessionActive]);
+
+    const handleExitSession = () => {
+        if (confirm(t('exit_session_confirm'))) {
+            setView('mode-selection');
+            if (setIsSessionActive) setIsSessionActive(false);
+        }
+    };
+    
+    const handleSessionComplete = useCallback(async (summary: SessionSummary) => {
+        setSessionSummary(summary);
+        setView('summary');
+        if (setIsSessionActive) setIsSessionActive(false);
+        if (summary.earnedStars > 0) {
+            await onProfileUpdate({ totalStars: increment(summary.earnedStars) });
+        }
+    }, [setIsSessionActive, onProfileUpdate]);
+    
+    const handleShare = (set: FlashcardSet) => {
+        setSetForSharing(set);
+        setIsShareModalOpen(true);
+    };
+
+    const handleReset = () => {
+        setView('subject-list');
+        setSelectedSubject(null);
+        setSelectedSet(null);
+        if (setIsSessionActive) setIsSessionActive(false);
+    };
+    
+    const commonProps = { userId, user, t, tSubject, getThemeClasses, showAppModal, onProfileUpdate, triggerHapticFeedback };
+    
+    if (view === 'subject-list') {
+        return <SubjectSelectionForFlashcards {...commonProps} onSelectSubject={(sub: string) => { setSelectedSubject(sub); setView('set-list'); }} onBack={onBack}/>;
+    }
+    if (view === 'set-list' && selectedSubject) {
+        return <SetListView {...commonProps} subject={selectedSubject} setSelectedSet={setSelectedSet} setView={setView} onBack={() => setView('subject-list')} onShare={handleShare} />;
+    }
+    if (view === 'mode-selection' && selectedSet) {
+        // ... Mode selection UI ...
+    }
+    if (view === 'manage' && selectedSet) {
+        return <CardManagerView {...commonProps} set={selectedSet} onBack={() => setView('set-list')} />;
+    }
+    if (view === 'learn' && selectedSet) {
+        return <LearnSessionView {...commonProps} set={selectedSet} onExit={handleExitSession} />;
+    }
+    if (view === 'cram' && selectedSet) {
+        return <CramSessionView {...commonProps} set={selectedSet} onExit={handleExitSession} />;
+    }
+    if (view === 'mc' && selectedSet) {
+        return <MultipleChoiceSessionView {...commonProps} set={selectedSet} onExit={handleExitSession} />;
+    }
+     if (view === 'vocab' && selectedSet) {
+        return <VocabSessionView {...commonProps} set={selectedSet} onExit={handleExitSession} onSessionComplete={handleSessionComplete} />;
+    }
+    if (view === 'summary' && sessionSummary && selectedSet) {
+        return <SessionSummaryView {...commonProps} set={selectedSet} summary={sessionSummary} onBack={() => setView('mode-selection')} setView={setView} setSelectedSet={setSelectedSet} />;
+    }
+     if (view === 'all-learned' && selectedSet) {
+        return <AllCardsLearnedView {...commonProps} set={selectedSet} setView={setView} />;
+    }
+
+    // Fallback or initial view rendering
+    return <SubjectSelectionForFlashcards {...commonProps} onSelectSubject={(sub: string) => { setSelectedSubject(sub); setView('set-list'); }} onBack={onBack}/>;
+};
+
+// FIX: Add default export to resolve module import errors.
+export default FlashcardsView;
